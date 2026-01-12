@@ -1,75 +1,97 @@
 import cv2
-import numpy as np # Needed for handling pixel arrays
+import numpy as np
 
 class MatrixGrid:
-    def __init__(self, width=640, height=480, rows=8, cols=16):
+    def __init__(self, width=640, height=480, rows=8, cols=16, cooldown_frames=5):
         self.width = width
         self.height = height
         self.rows = rows
         self.cols = cols
+        
+        # Grid dimensions
         self.cell_w = self.width // self.cols
         self.cell_h = self.height // self.rows
 
+        # --- NEW: Temporal Smoothing Variables ---
+        self.cooldown_frames = cooldown_frames
+        # A 2D array to track how long each cell must stay "OFF"
+        # If value > 0, the cell is blocked. If 0, it is safe.
+        self.cooldown_tracker = np.zeros((rows, cols), dtype=int)
+
     def get_cell_coordinates(self, row, col):
-        """Helper to get bounding box of a specific cell."""
         x1 = col * self.cell_w
         y1 = row * self.cell_h
         x2 = x1 + self.cell_w
         y2 = y1 + self.cell_h
         return x1, y1, x2, y2
 
-    def scan_for_glare(self, frame, threshold=220):
+    def scan_for_glare(self, frame, threshold=220, min_blob_area=20):
         """
-        TASK 4: LOGIC IMPLEMENTATION
-        1. Convert to Grayscale
-        2. Threshold to find bright spots
-        3. Map spots to grid cells
+        Detects glare and updates the cooldown timers.
+        Returns:
+            final_blocked_cells: List of cells that should be visually RED.
+            clean_mask: For debugging.
         """
-        # [Step 1] Grayscale Conversion
+        # 1. Image Pre-processing (Blurring reduces random noise)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0) # Gaussian Blur
+        _, raw_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
 
-        # [Step 2] Bright Spot Thresholding
-        # Pixels brighter than 'threshold' become 255 (White), others 0 (Black)
-        # Note: 220 is a high threshold (only very bright lights), lower it if detection fails.
-        _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        # 2. Contour Filtering (From previous task)
+        contours, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        clean_mask = np.zeros_like(raw_mask)
 
-        glare_cells = [] # List to store (row, col) of cells detecting glare
+        for cnt in contours:
+            if cv2.contourArea(cnt) > min_blob_area:
+                cv2.drawContours(clean_mask, [cnt], -1, 255, thickness=cv2.FILLED)
 
-        # [Step 3] Pixel-to-Grid Mapping
+        # 3. Update Cooldown Logic
+        current_frame_glare = set()
+
+        # Identify which cells have glare RIGHT NOW
         for row in range(self.rows):
             for col in range(self.cols):
-                # Get the boundaries for this specific LED cell
                 x1, y1, x2, y2 = self.get_cell_coordinates(row, col)
+                cell_roi = clean_mask[y1:y2, x1:x2]
+                
+                if cv2.countNonZero(cell_roi) > 0:
+                    current_frame_glare.add((row, col))
 
-                # Extract just this cell's area from the threshold mask
-                cell_roi = mask[y1:y2, x1:x2]
+        # Update the Timers
+        final_blocked_cells = []
+        
+        for row in range(self.rows):
+            for col in range(self.cols):
+                if (row, col) in current_frame_glare:
+                    # CASE A: Glare Detected NOW
+                    # Reset timer to max (keep it blocked)
+                    self.cooldown_tracker[row, col] = self.cooldown_frames
+                else:
+                    # CASE B: No Glare Now
+                    # Decrease timer (cool down)
+                    if self.cooldown_tracker[row, col] > 0:
+                        self.cooldown_tracker[row, col] -= 1
 
-                # Count how many "bright" pixels are in this cell
-                bright_pixel_count = cv2.countNonZero(cell_roi)
+                # If the timer is still active, the cell is considered BLOCKED
+                if self.cooldown_tracker[row, col] > 0:
+                    final_blocked_cells.append((row, col))
 
-                # If we see enough bright pixels (sensitivity), mark this cell
-                if bright_pixel_count > 5:  
-                    glare_cells.append((row, col))
-
-        return glare_cells, mask
+        return final_blocked_cells, clean_mask
 
     def draw_grid(self, frame, active_glare_cells=[]):
-        """
-        Draws the grid. If a cell is in 'active_glare_cells', it draws it RED (blocked).
-        Otherwise, it draws it GREEN (safe/illuminated).
-        """
-        # Draw the logic results
         for row in range(self.rows):
             for col in range(self.cols):
                 x1, y1, x2, y2 = self.get_cell_coordinates(row, col)
                 
                 if (row, col) in active_glare_cells:
-                    # GLARE DETECTED: Draw filled Red rectangle (Simulating LED OFF/Masking)
-                    # Use alpha blending for a transparent look if desired, but simple rect for now
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2) # Red Border
-                    cv2.putText(frame, "OFF", (x1+5, y1+20), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,0,255), 1)
+                    # RED (Blocked/OFF)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    # Optional: Show the timer value to see the cooldown working
+                    timer_val = self.cooldown_tracker[row, col]
+                    cv2.putText(frame, str(timer_val), (x1+10, y1+30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
                 else:
-                    # SAFE: Draw Green Border (Simulating LED ON)
+                    # GREEN (Safe/ON)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
         return frame
