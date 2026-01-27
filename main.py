@@ -1,50 +1,57 @@
 import cv2
+import time
 from input_handler import VideoLoader
 from grid_manager import MatrixGrid
+from yolo_detector import YoloBrain
 
 def main():
-    # --- 1. CONFIGURATION (Define these variables first) ---
-    VIDEO_SOURCE = "C:/Users/jomon/MCA/data/video3.mp4"          # Use 0 for webcam, or path to video file
-    FRAME_WIDTH = 640         # <--- These were missing
-    FRAME_HEIGHT = 480        # <--- These were missing
-    COOLDOWN_FRAMES = 10      # How long (in frames) a cell stays red
+    # 1. Config
+    VIDEO_SOURCE = "C:/Users/jomon/MCA/data/video6.mp4"
+    FRAME_WIDTH = 640
+    FRAME_HEIGHT = 480
     
-    # --- 2. INITIALIZE MODULES ---
     loader = VideoLoader(source=VIDEO_SOURCE, width=FRAME_WIDTH, height=FRAME_HEIGHT)
-    
-    # Initialize grid with the configuration variables
-    grid = MatrixGrid(width=FRAME_WIDTH, height=FRAME_HEIGHT, cooldown_frames=COOLDOWN_FRAMES)
+    grid = MatrixGrid(width=FRAME_WIDTH, height=FRAME_HEIGHT, cooldown_frames=8)
+    brain = YoloBrain(conf_threshold=0.5)
 
-    print("Running ADB Simulation (Sprint 2 - Stable)")
-    print("Press 'q' to exit.")
+    print("Running ADB Hybrid System (YOLO + Brightness)")
+    prev_time = 0
 
     try:
         while True:
-            # 3. Get Input
+            curr_time = time.time()
             frame = loader.get_frame()
-            if frame is None:
-                print("Video ended.")
-                break
+            if frame is None: break
 
-            # 4. Processing (New Logic with Cooldown)
-            # You can tweak 'min_blob_area' here to ignore smaller lights
-            glare_cells, clean_mask = grid.scan_for_glare(frame, threshold=220, min_blob_area=20)
+            # --- HYBRID PIPELINE ---
+            # 1. Run YOLO to get boxes
+            vehicle_boxes = brain.detect_vehicles(frame)
             
-            # 5. Visualization
+            # 2. Run Grid Update (Passes frame for brightness + boxes for YOLO)
+            # The grid manager now merges them internally
+            glare_cells, clean_mask = grid.update(frame, vehicle_boxes)
+            
+            # 3. Visualize
             output_frame = grid.draw_grid(frame, active_glare_cells=glare_cells)
 
-            # Show Main Output
-            cv2.imshow('ADB Output', output_frame)
-            
-            # Show Debug Mask (Optional - helps you see what the computer detects)
-            cv2.imshow('Debug: Brain View', clean_mask)
+            # Draw YOLO boxes for debugging
+            for box in vehicle_boxes:
+                cv2.rectangle(output_frame, (box[0], box[1]), (box[2], box[3]), (255, 0, 255), 2)
 
-            # Exit on 'q'
-            if cv2.waitKey(30) & 0xFF == ord('q'):
+            # FPS
+            delta_time = curr_time - prev_time
+            prev_time = curr_time
+            fps = 1 / delta_time if delta_time > 0 else 0
+            cv2.putText(output_frame, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+            cv2.imshow('ADB Hybrid Output', output_frame)
+            cv2.imshow('Debug: Brightness Mask', clean_mask) # See what the brightness logic sees
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-                
+
     except KeyboardInterrupt:
-        print("Stopped by user.")
+        print("Stopped.")
     finally:
         loader.release()
         cv2.destroyAllWindows()
