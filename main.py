@@ -1,4 +1,6 @@
 import cv2
+import json
+import os
 import time
 from input_handler import VideoLoader
 from grid_manager import MatrixGrid
@@ -6,20 +8,38 @@ from centroid_tracker import CentroidTracker
 from yolo_detector import YoloBrain
 from speed_controller import SpeedSimulator
 
+
+def load_config(config_path="config.json"):
+    """Load a JSON config file if it exists (otherwise return empty dict)."""
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
 def main():
-    VIDEO_SOURCE = "C:/Users/jomon/MCA/data/video3.mp4" 
-    FRAME_WIDTH = 640
-    FRAME_HEIGHT = 480
-    TARGET_FPS = 30
+    config = load_config()
+
+    VIDEO_SOURCE = config.get("video_source", "C:/Users/jomon/MCA/data/video3.mp4")
+    FRAME_WIDTH = config.get("frame_width", 640)
+    FRAME_HEIGHT = config.get("frame_height", 480)
+    TARGET_FPS = config.get("target_fps", 30)
     FRAME_DURATION = 1.0 / TARGET_FPS
-    
-    # Run AI every 5 frames to keep City Mode fast but smart
-    YOLO_SKIP_FRAMES = 5 
-    
+
+    # Run AI every N frames to keep City Mode fast but smart
+    YOLO_SKIP_FRAMES = config.get("yolo_skip_frames", 5)
+
     loader = VideoLoader(source=VIDEO_SOURCE, width=FRAME_WIDTH, height=FRAME_HEIGHT)
-    grid = MatrixGrid(width=FRAME_WIDTH, height=FRAME_HEIGHT, cooldown_frames=5)
-    brain = YoloBrain(conf_threshold=0.5)
-    car = SpeedSimulator(initial_speed=40) 
+    grid = MatrixGrid(
+        width=FRAME_WIDTH,
+        height=FRAME_HEIGHT,
+        **config.get("grid", {}),
+    )
+    brain = YoloBrain(conf_threshold=config.get("yolo_conf_threshold", 0.5))
+    car = SpeedSimulator(
+        initial_speed=config.get("initial_speed", 40),
+        highway_threshold=config.get("highway_speed_threshold", 60),
+    )
     tracker = CentroidTracker(max_disappeared=2)
 
     print("Running ADB: Smart City Mode (Streetlight Filtering)")

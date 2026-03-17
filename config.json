@@ -1,0 +1,23 @@
+{
+  "video_source": "C:/Users/jomon/MCA/data/video3.mp4",
+  "frame_width": 640,
+  "frame_height": 480,
+  "target_fps": 30,
+  "yolo_skip_frames": 5,
+  "yolo_conf_threshold": 0.5,
+  "initial_speed": 40,
+  "highway_speed_threshold": 60,
+  "grid": {
+    "rows": 8,
+    "cols": 16,
+    "cooldown_frames": 5,
+    "safety_buffer_cols": 1,
+    "mask_color": [0, 0, 0],
+    "legacy_style": true,
+    "beam_color": [255, 255, 0],
+    "city_threshold": 220,
+    "highway_threshold": 200,
+    "city_min_blob_area": 50,
+    "highway_min_blob_area": 30
+  }
+}

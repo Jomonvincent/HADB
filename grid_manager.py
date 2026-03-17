@@ -2,14 +2,33 @@ import cv2
 import numpy as np
 
 class MatrixGrid:
-    def __init__(self, width=640, height=480, rows=8, cols=16, cooldown_frames=5, safety_buffer_cols=1, mask_color=(0,0,0), legacy_style=True, beam_color=(255,255,0)):
+    def __init__(
+        self,
+        width=640,
+        height=480,
+        rows=8,
+        cols=16,
+        cooldown_frames=5,
+        safety_buffer_cols=1,
+        mask_color=(0, 0, 0),
+        legacy_style=True,
+        beam_color=(255, 255, 0),
+        city_threshold=220,
+        highway_threshold=200,
+        city_min_blob_area=50,
+        highway_min_blob_area=30,
+        static_decay=0.02,
+        static_threshold=0.6,
+        motion_threshold=25,
+        motion_required_overlap=5,
+    ):
         self.width = width
         self.height = height
         self.rows = rows
         self.cols = cols
         self.cell_w = self.width // self.cols
         self.cell_h = self.height // self.rows
-        
+
         # Cooldown Logic
         self.cooldown_frames = cooldown_frames
         self.cooldown_tracker = np.zeros((rows, cols), dtype=int)
@@ -26,16 +45,24 @@ class MatrixGrid:
         self.beam_color = tuple(int(c) for c in beam_color)
         self.blocked_border_color = (0, 0, 255)
         self.normal_border_color = (50, 50, 50)
+
+        # Thresholds & sensitivity (configurable)
+        self.city_threshold = city_threshold
+        self.highway_threshold = highway_threshold
+        self.city_min_blob_area = city_min_blob_area
+        self.highway_min_blob_area = highway_min_blob_area
+
         # Static bright accumulation to ignore fixed streetlights
         self.static_accum = np.zeros((self.height, self.width), dtype=float)
         self.static_mask = np.zeros((self.height, self.width), dtype=np.uint8)
-        self.static_decay = 0.02  # running average weight for current frame
-        self.static_threshold = 0.6
+        self.static_decay = static_decay  # running average weight for current frame
+        self.static_threshold = static_threshold
+
         # Motion confirmation params
         self.prev_gray = None
-        self.motion_threshold = 25
-        self.motion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-        self.motion_required_overlap = 5  # pixels overlap required between contour and motion mask
+        self.motion_threshold = motion_threshold
+        self.motion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self.motion_required_overlap = motion_required_overlap  # pixels overlap required between contour and motion mask
 
     def get_cell_coordinates(self, row, col):
         x1 = col * self.cell_w
@@ -186,11 +213,19 @@ class MatrixGrid:
         # 1. Always Run Blob Detection (Primary)
         # We adjust sensitivity based on mode, but we always run it.
         if mode == "CITY":
-            # In City, we might use a higher threshold to ignore reflections
-            blob_cells, debug_mask = self._get_brightness_cells(frame, threshold=220, min_blob_area=50)
-        else: # HIGHWAY
+            # In City, we might use a higher threshold to ignore reflections/streetlights
+            blob_cells, debug_mask = self._get_brightness_cells(
+                frame,
+                threshold=self.city_threshold,
+                min_blob_area=self.city_min_blob_area,
+            )
+        else:  # HIGHWAY
             # In Highway, we need max sensitivity (catch distant lights)
-            blob_cells, debug_mask = self._get_brightness_cells(frame, threshold=200, min_blob_area=30)
+            blob_cells, debug_mask = self._get_brightness_cells(
+                frame,
+                threshold=self.highway_threshold,
+                min_blob_area=self.highway_min_blob_area,
+            )
 
         # 2. Run YOLO (Secondary / Failsafe)
         yolo_cells = self._get_yolo_cells(yolo_boxes)
