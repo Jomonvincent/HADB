@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 class MatrixGrid:
-    def __init__(self, width=640, height=480, rows=8, cols=16, cooldown_frames=5):
+    def __init__(self, width=640, height=480, rows=8, cols=16, cooldown_frames=5, safety_buffer_cols=1, mask_color=(0,0,0), legacy_style=True, beam_color=(255,255,0)):
         self.width = width
         self.height = height
         self.rows = rows
@@ -13,6 +13,29 @@ class MatrixGrid:
         # Cooldown Logic
         self.cooldown_frames = cooldown_frames
         self.cooldown_tracker = np.zeros((rows, cols), dtype=int)
+        # Alpha blending for dimming animation (per cell)
+        self.alpha = np.zeros((rows, cols), dtype=float)
+        self.target_alpha = np.zeros((rows, cols), dtype=float)
+        self.max_alpha = 0.7
+        self.alpha_smooth = 0.3
+        self.safety_buffer_cols = safety_buffer_cols
+        # mask_color should be a tuple (B,G,R) between 0-255
+        self.mask_color = tuple(int(c) for c in mask_color)
+        # Legacy rendering options (restores previous yellow/red grid look)
+        self.legacy_style = bool(legacy_style)
+        self.beam_color = tuple(int(c) for c in beam_color)
+        self.blocked_border_color = (0, 0, 255)
+        self.normal_border_color = (50, 50, 50)
+        # Static bright accumulation to ignore fixed streetlights
+        self.static_accum = np.zeros((self.height, self.width), dtype=float)
+        self.static_mask = np.zeros((self.height, self.width), dtype=np.uint8)
+        self.static_decay = 0.02  # running average weight for current frame
+        self.static_threshold = 0.6
+        # Motion confirmation params
+        self.prev_gray = None
+        self.motion_threshold = 25
+        self.motion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+        self.motion_required_overlap = 5  # pixels overlap required between contour and motion mask
 
     def get_cell_coordinates(self, row, col):
         x1 = col * self.cell_w
@@ -22,29 +45,84 @@ class MatrixGrid:
         return x1, y1, x2, y2
 
     # --- DETECTOR 1: BRIGHTNESS (Gaussian + Threshold) ---
-    def _get_brightness_cells(self, frame, threshold=220, min_blob_area=50):
+    # --- DETECTOR 1: BRIGHTNESS (Gaussian + Threshold) ---
+    def _get_brightness_cells(self, frame, threshold=220, min_blob_area=30):
+        """
+        Detects bright spots in the image. 
+        (Simplified: No longer requires YOLO validation to ensure safety against high beams)
+        """
+        # Convert to gray and smooth
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         _, raw_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
-        
-        # Filter noise with contours
-        clean_mask = np.zeros_like(raw_mask)
-        contours, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Update static accumulation to detect persistent bright pixels (streetlights)
+        raw_mask_norm = (raw_mask / 255.0).astype(float)
+        self.static_accum = (1.0 - self.static_decay) * self.static_accum + self.static_decay * raw_mask_norm
+        self.static_mask = (self.static_accum >= self.static_threshold).astype(np.uint8)
+
+        # Suppress static bright pixels from consideration
+        raw_mask_clean = raw_mask.copy()
+        raw_mask_clean[self.static_mask == 1] = 0
+
+        # Motion mask (frame-diff) for motion confirmation
+        if self.prev_gray is None:
+            motion_mask = np.zeros_like(raw_mask)
+        else:
+            diff = cv2.absdiff(blurred, self.prev_gray)
+            _, motion_mask = cv2.threshold(diff, self.motion_threshold, 255, cv2.THRESH_BINARY)
+            motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, self.motion_kernel)
+
+        # Store current gray for next frame
+        self.prev_gray = blurred
+
+        # Find contours on cleaned mask
+        contours, _ = cv2.findContours(raw_mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        valid_blobs_mask = np.zeros_like(raw_mask)
+
         for cnt in contours:
-            if cv2.contourArea(cnt) > min_blob_area:
-                cv2.drawContours(clean_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+            area = cv2.contourArea(cnt)
+            if area < min_blob_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect = float(h) / float(max(w, 1))
+
+            # Heuristics to ignore tall streetlight-like shapes and high-frame objects
+            if aspect > 2.0:
+                continue
+            if (y + h/2.0) < (self.height * 0.25):
+                # too high in frame — likely a streetlight
+                continue
+
+            # Motion confirmation: require some motion overlap unless tracked by YOLO later
+            # Count overlap between contour bbox and motion_mask
+            roi_motion = motion_mask[y:y+h, x:x+w]
+            overlap = int(cv2.countNonZero(roi_motion))
+            if overlap < self.motion_required_overlap:
+                # small or no motion — treat cautiously, ignore as headlight
+                continue
+
+            # Passed heuristics — mark as valid blob
+            cv2.drawContours(valid_blobs_mask, [cnt], -1, 255, thickness=cv2.FILLED)
 
         # Map to grid
         active_cells = set()
         for row in range(self.rows):
             for col in range(self.cols):
                 x1, y1, x2, y2 = self.get_cell_coordinates(row, col)
-                cell_roi = clean_mask[y1:y2, x1:x2]
+                cell_roi = valid_blobs_mask[y1:y2, x1:x2]
                 if cv2.countNonZero(cell_roi) > 0:
                     active_cells.add((row, col))
-        
-        return active_cells, clean_mask
 
+        # Build a debug visualization: R=clean raw mask, G=static mask, B=motion mask
+        debug_vis = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        debug_vis[:, :, 2] = raw_mask_clean
+        debug_vis[:, :, 1] = (self.static_mask * 255).astype(np.uint8)
+        debug_vis[:, :, 0] = motion_mask
+
+        return active_cells, debug_vis
     # --- DETECTOR 2: YOLO (Bounding Boxes) ---
     def _get_yolo_cells(self, vehicle_boxes):
         active_cells = set()
@@ -67,51 +145,125 @@ class MatrixGrid:
                             break 
         return active_cells
 
+    def _get_tracked_cells(self, tracked_objects):
+        """
+        Map tracked centroids (+bbox width) to vertical columns (zones).
+        Returns set of (row, col) cells covering the columns across all rows.
+        """
+        active_cells = set()
+        if not tracked_objects:
+            return active_cells
+
+        for oid, val in tracked_objects.items():
+            try:
+                cx, cy, bbox = val
+                bx1, by1, bx2, by2 = bbox
+                veh_w = bx2 - bx1
+                half_w = veh_w / 2.0
+                left_px = int(max(0, cx - half_w))
+                right_px = int(min(self.width - 1, cx + half_w))
+                # apply safety buffer in columns
+                left_col = max(0, (left_px // self.cell_w) - self.safety_buffer_cols)
+                right_col = min(self.cols - 1, (right_px // self.cell_w) + self.safety_buffer_cols)
+                for col in range(left_col, right_col + 1):
+                    for row in range(self.rows):
+                        active_cells.add((row, col))
+            except Exception:
+                continue
+
+        return active_cells
+
     # --- MASTER UPDATE FUNCTION ---
-    def update(self, frame, yolo_boxes):
+    def update(self, frame, yolo_boxes, tracked_objects=None, mode="CITY"):
         """
-        Combines YOLO and Brightness detection, applies cooldown, 
-        and returns the final list of blocked cells.
+        Safety-First Hybrid Logic:
+        - We ALWAYS trust the Blob Detector (because high beams wash out YOLO).
+        - We ADD YOLO detections to catch non-glaring cars.
         """
-        # 1. Get inputs from both systems
-        brightness_set, debug_mask = self._get_brightness_cells(frame)
-        yolo_set = self._get_yolo_cells(yolo_boxes)
+        active_cells = set()
+        debug_mask = None
 
-        # 2. HYBRID FUSION: Union of both sets (A OR B)
-        combined_active_cells = brightness_set.union(yolo_set)
+        # 1. Always Run Blob Detection (Primary)
+        # We adjust sensitivity based on mode, but we always run it.
+        if mode == "CITY":
+            # In City, we might use a higher threshold to ignore reflections
+            blob_cells, debug_mask = self._get_brightness_cells(frame, threshold=220, min_blob_area=50)
+        else: # HIGHWAY
+            # In Highway, we need max sensitivity (catch distant lights)
+            blob_cells, debug_mask = self._get_brightness_cells(frame, threshold=200, min_blob_area=30)
 
-        # 3. Apply Cooldown Logic
+        # 2. Run YOLO (Secondary / Failsafe)
+        yolo_cells = self._get_yolo_cells(yolo_boxes)
+
+        # 2b. Map tracked objects (centroid -> columns)
+        tracked_cells = self._get_tracked_cells(tracked_objects) if tracked_objects is not None else set()
+
+        # 3. SAFETY UNION: Combine BOTH results
+        # If EITHER system sees a threat, we block the cell.
+        # Combine blob detector, YOLO and tracked mapping
+        combined_active_cells = blob_cells.union(yolo_cells).union(tracked_cells)
+
+        # --- COOLDOWN LOGIC ---
+        # Update cooldown and target alpha per cell
         final_blocked_cells = []
         for row in range(self.rows):
             for col in range(self.cols):
                 if (row, col) in combined_active_cells:
-                    # Reset timer if EITHER system detects something
                     self.cooldown_tracker[row, col] = self.cooldown_frames
                 else:
-                    # Cool down if BOTH are clear
                     if self.cooldown_tracker[row, col] > 0:
                         self.cooldown_tracker[row, col] -= 1
-                
-                # If timer is running, the cell is blocked
+
+                # Set target alpha based on whether cell is considered blocked
                 if self.cooldown_tracker[row, col] > 0:
+                    self.target_alpha[row, col] = self.max_alpha
+                else:
+                    self.target_alpha[row, col] = 0.0
+
+                # Smooth alpha transition
+                self.alpha[row, col] += (self.target_alpha[row, col] - self.alpha[row, col]) * self.alpha_smooth
+
+                # Consider cell blocked if alpha is above small threshold
+                if self.alpha[row, col] > 0.03:
                     final_blocked_cells.append((row, col))
 
         return final_blocked_cells, debug_mask
 
     def draw_grid(self, frame, active_glare_cells=[]):
-        # (Same realistic beam drawing logic as Sprint 3)
-        overlay = frame.copy()
-        beam_color = (255, 255, 0)
-        
+        # If legacy style requested, render using previous colored grid (yellow light, red borders)
+        if self.legacy_style:
+            overlay = frame.copy()
+            for row in range(self.rows):
+                for col in range(self.cols):
+                    x1, y1, x2, y2 = self.get_cell_coordinates(row, col)
+                    if (row, col) in active_glare_cells:
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1) # Blocked
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), self.blocked_border_color, 2)
+                    else:
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), self.beam_color, -1) # Light
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), self.normal_border_color, 1)
+
+            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+            return frame
+
+        # New style: Per-cell alpha blending: shaded overlay on blocked cells, smooth fade
+        out = frame
+
         for row in range(self.rows):
             for col in range(self.cols):
                 x1, y1, x2, y2 = self.get_cell_coordinates(row, col)
-                if (row, col) in active_glare_cells:
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1) # Blocked
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)  # Red Border
-                else:
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2), beam_color, -1) # Light
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (50, 50, 50), 1)
+                a = float(self.alpha[row, col])
+                if a <= 0.001:
+                    # draw subtle grid boundary only
+                    cv2.rectangle(out, (x1, y1), (x2, y2), (40, 40, 40), 1)
+                    continue
 
-        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-        return frame
+                # blend a shaded rectangle over ROI using configured mask color
+                roi = out[y1:y2, x1:x2]
+                mask_rect = np.full_like(roi, self.mask_color)
+                blended = cv2.addWeighted(mask_rect, a, roi, 1.0 - a, 0)
+                out[y1:y2, x1:x2] = blended
+                # draw faint border for blocked zones
+                cv2.rectangle(out, (x1, y1), (x2, y2), (20, 20, 20), 1)
+
+        return out
