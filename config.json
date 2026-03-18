@@ -7,6 +7,9 @@
   "yolo_conf_threshold": 0.5,
   "initial_speed": 40,
   "highway_speed_threshold": 60,
+  "max_tracker_jump_pct": 0.3,
+  "log_path": "logs/glare_events.csv",
+  "hardware": "mock",
   "grid": {
     "rows": 8,
     "cols": 16,
@@ -18,6 +21,9 @@
     "city_threshold": 220,
     "highway_threshold": 200,
     "city_min_blob_area": 50,
-    "highway_min_blob_area": 30
+    "highway_min_blob_area": 30,
+    "downsample_size": [320, 240],
+    "roi_top_pct": 0.25,
+    "roi_bottom_pct": 0.1
   }
 }

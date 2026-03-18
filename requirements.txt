@@ -1,0 +1,6 @@
+Jinja2==3.1.6
+PyYAML==6.0.3
+charset-normalizer==3.4.4
+pip-chill==1.0.5
+pipreqs==0.4.13
+ultralytics==8.3.243

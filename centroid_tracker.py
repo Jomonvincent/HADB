@@ -1,17 +1,36 @@
 import math
 
+
 class CentroidTracker:
-    def __init__(self, max_disappeared=2):
-        # objectID -> (cx, cy, (x1,y1,x2,y2))
-        self.objects = dict()
-        self.disappeared = dict()
+    def __init__(self, max_disappeared=2, max_distance_pct=0.3, frame_width=640):
+        """Tracks object centroids with a simple motion model.
+
+        Args:
+            max_disappeared: Frames allowed with missing detections before deregistering.
+            max_distance_pct: If an object jumps more than this fraction of the frame width,
+                it is treated as a new detection rather than a match.
+            frame_width: Used to compute the max jump distance.
+        """
+        self.objects = {}  # object_id -> { centroid, bbox, velocity }
+        self.disappeared = {}  # object_id -> frames missing
         self.next_object_id = 1
         self.max_disappeared = max_disappeared
+        self.max_distance_pct = max_distance_pct
+        self.max_distance = int(frame_width * max_distance_pct)
+
+    def _predict_centroid(self, obj):
+        cx, cy = obj["centroid"]
+        vx, vy = obj.get("velocity", (0, 0))
+        return (int(cx + vx), int(cy + vy))
 
     def register(self, centroid, bbox):
         oid = self.next_object_id
         self.next_object_id += 1
-        self.objects[oid] = (centroid[0], centroid[1], bbox)
+        self.objects[oid] = {
+            "centroid": (centroid[0], centroid[1]),
+            "bbox": bbox,
+            "velocity": (0, 0),
+        }
         self.disappeared[oid] = 0
         return oid
 
@@ -22,12 +41,24 @@ class CentroidTracker:
             del self.disappeared[oid]
 
     def update(self, boxes):
-        """
-        boxes: list of boxes where each box is (x1,y1,x2,y2, ...)
-        Returns internal `objects` mapping: objectID -> (cx, cy, bbox)
+        """Update tracked objects based on newly detected bounding boxes.
+
+        Args:
+            boxes: list of boxes in the form (x1, y1, x2, y2, ...).
+
+        Returns:
+            dict: objectID -> (cx, cy, bbox)
         """
         input_centroids = []
         input_bboxes = []
+
+        if boxes is None:
+            # Sensor failure / missing frame: keep predictions but do not update.
+            for oid, obj in list(self.objects.items()):
+                predicted = self._predict_centroid(obj)
+                # Keep bbox unchanged since we don't have current detection
+                self.objects[oid]["centroid"] = predicted
+            return {oid: (obj["centroid"][0], obj["centroid"][1], obj["bbox"]) for oid, obj in self.objects.items()}
 
         for b in boxes:
             bx1, by1, bx2, by2 = b[:4]
@@ -36,34 +67,34 @@ class CentroidTracker:
             input_centroids.append((cx, cy))
             input_bboxes.append((bx1, by1, bx2, by2))
 
-        # No detections: mark disappeared
+        # No detections: use predicted positions (skip frame prediction)
         if len(input_centroids) == 0:
-            for oid in list(self.disappeared.keys()):
-                self.disappeared[oid] += 1
-                if self.disappeared[oid] > self.max_disappeared:
-                    self.deregister(oid)
-            return self.objects
+            for oid, obj in list(self.objects.items()):
+                predicted = self._predict_centroid(obj)
+                self.objects[oid]["centroid"] = predicted
+                # Do not mark disappeared during inference skip frames
+            return {oid: (obj["centroid"][0], obj["centroid"][1], obj["bbox"]) for oid, obj in self.objects.items()}
 
         # If no existing objects, register all inputs
         if len(self.objects) == 0:
             for i, c in enumerate(input_centroids):
                 self.register(c, input_bboxes[i])
-            return self.objects
+            return {oid: (obj["centroid"][0], obj["centroid"][1], obj["bbox"]) for oid, obj in self.objects.items()}
 
-        # Build distance matrix between existing object centroids and new centroids
+        # Build distance matrix between predicted existing centroids and new centroids
         object_ids = list(self.objects.keys())
-        existing_centroids = [ (self.objects[oid][0], self.objects[oid][1]) for oid in object_ids ]
+        predicted_centroids = [self._predict_centroid(self.objects[oid]) for oid in object_ids]
 
         D = []
-        for ec in existing_centroids:
+        for pc in predicted_centroids:
             row = []
             for ic in input_centroids:
-                dx = ec[0] - ic[0]
-                dy = ec[1] - ic[1]
+                dx = pc[0] - ic[0]
+                dy = pc[1] - ic[1]
                 row.append(math.hypot(dx, dy))
             D.append(row)
 
-        # Greedy matching by smallest distances
+        # Greedy matching by smallest distances (with max distance threshold)
         assigned_rows = set()
         assigned_cols = set()
         matches = []  # (rowIdx, colIdx)
@@ -76,11 +107,14 @@ class CentroidTracker:
         for dist, r, c in distance_items:
             if r in assigned_rows or c in assigned_cols:
                 continue
+            if dist > self.max_distance:
+                # Too far to be a plausible match; treat as new object
+                continue
             assigned_rows.add(r)
             assigned_cols.add(c)
             matches.append((r, c))
 
-        unmatched_rows = set(range(len(existing_centroids))) - assigned_rows
+        unmatched_rows = set(range(len(predicted_centroids))) - assigned_rows
         unmatched_cols = set(range(len(input_centroids))) - assigned_cols
 
         # Update matched objects
@@ -88,7 +122,12 @@ class CentroidTracker:
             oid = object_ids[r]
             cx, cy = input_centroids[c]
             bbox = input_bboxes[c]
-            self.objects[oid] = (cx, cy, bbox)
+            old_centroid = self.objects[oid]["centroid"]
+            vx = cx - old_centroid[0]
+            vy = cy - old_centroid[1]
+            self.objects[oid]["centroid"] = (cx, cy)
+            self.objects[oid]["bbox"] = bbox
+            self.objects[oid]["velocity"] = (vx, vy)
             self.disappeared[oid] = 0
 
         # Increase disappeared for unmatched existing objects
@@ -102,4 +141,4 @@ class CentroidTracker:
         for c in unmatched_cols:
             self.register(input_centroids[c], input_bboxes[c])
 
-        return self.objects
+        return {oid: (obj["centroid"][0], obj["centroid"][1], obj["bbox"]) for oid, obj in self.objects.items()}

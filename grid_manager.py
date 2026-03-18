@@ -21,6 +21,9 @@ class MatrixGrid:
         static_threshold=0.6,
         motion_threshold=25,
         motion_required_overlap=5,
+        downsample_size=(320, 240),
+        roi_top_pct=0.25,
+        roi_bottom_pct=0.1,
     ):
         self.width = width
         self.height = height
@@ -46,6 +49,11 @@ class MatrixGrid:
         self.blocked_border_color = (0, 0, 255)
         self.normal_border_color = (50, 50, 50)
 
+        # Downsample / ROI settings (performance & false-positive reduction)
+        self.downsample_size = downsample_size
+        self.roi_top_pct = roi_top_pct
+        self.roi_bottom_pct = roi_bottom_pct
+
         # Thresholds & sensitivity (configurable)
         self.city_threshold = city_threshold
         self.highway_threshold = highway_threshold
@@ -53,8 +61,10 @@ class MatrixGrid:
         self.highway_min_blob_area = highway_min_blob_area
 
         # Static bright accumulation to ignore fixed streetlights
-        self.static_accum = np.zeros((self.height, self.width), dtype=float)
-        self.static_mask = np.zeros((self.height, self.width), dtype=np.uint8)
+        # We keep this at the downsampled resolution for performance.
+        ds_h, ds_w = self.downsample_size[1], self.downsample_size[0]
+        self.static_accum = np.zeros((ds_h, ds_w), dtype=float)
+        self.static_mask = np.zeros((ds_h, ds_w), dtype=np.uint8)
         self.static_decay = static_decay  # running average weight for current frame
         self.static_threshold = static_threshold
 
@@ -74,14 +84,23 @@ class MatrixGrid:
     # --- DETECTOR 1: BRIGHTNESS (Gaussian + Threshold) ---
     # --- DETECTOR 1: BRIGHTNESS (Gaussian + Threshold) ---
     def _get_brightness_cells(self, frame, threshold=220, min_blob_area=30):
+        """Detects bright blobs (headlights) using a downsampled ROI.
+
+        The system defaults to a "safe state" by requiring motion confirmation and
+        by ignoring the sky / hood regions.
         """
-        Detects bright spots in the image. 
-        (Simplified: No longer requires YOLO validation to ensure safety against high beams)
-        """
-        # Convert to gray and smooth
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Downsample the frame for faster processing
+        ds_frame = cv2.resize(frame, self.downsample_size)
+        gray = cv2.cvtColor(ds_frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         _, raw_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
+
+        # Apply vertical ROI: ignore top (sky/streetlights) and bottom (hood)
+        h = raw_mask.shape[0]
+        top_cut = int(h * self.roi_top_pct)
+        bottom_cut = int(h * (1.0 - self.roi_bottom_pct))
+        raw_mask[:top_cut, :] = 0
+        raw_mask[bottom_cut:, :] = 0
 
         # Update static accumulation to detect persistent bright pixels (streetlights)
         raw_mask_norm = (raw_mask / 255.0).astype(float)
@@ -116,11 +135,8 @@ class MatrixGrid:
             x, y, w, h = cv2.boundingRect(cnt)
             aspect = float(h) / float(max(w, 1))
 
-            # Heuristics to ignore tall streetlight-like shapes and high-frame objects
+            # Heuristics to ignore tall streetlight-like shapes
             if aspect > 2.0:
-                continue
-            if (y + h/2.0) < (self.height * 0.25):
-                # too high in frame — likely a streetlight
                 continue
 
             # Motion confirmation: require some motion overlap unless tracked by YOLO later
@@ -134,20 +150,27 @@ class MatrixGrid:
             # Passed heuristics — mark as valid blob
             cv2.drawContours(valid_blobs_mask, [cnt], -1, 255, thickness=cv2.FILLED)
 
-        # Map to grid
+        # Map to grid using downsampled cell sizes
         active_cells = set()
+        ds_cell_w = self.downsample_size[0] // self.cols
+        ds_cell_h = self.downsample_size[1] // self.rows
+
         for row in range(self.rows):
             for col in range(self.cols):
-                x1, y1, x2, y2 = self.get_cell_coordinates(row, col)
+                x1 = col * ds_cell_w
+                y1 = row * ds_cell_h
+                x2 = x1 + ds_cell_w
+                y2 = y1 + ds_cell_h
                 cell_roi = valid_blobs_mask[y1:y2, x1:x2]
                 if cv2.countNonZero(cell_roi) > 0:
                     active_cells.add((row, col))
 
         # Build a debug visualization: R=clean raw mask, G=static mask, B=motion mask
-        debug_vis = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        debug_vis[:, :, 2] = raw_mask_clean
-        debug_vis[:, :, 1] = (self.static_mask * 255).astype(np.uint8)
-        debug_vis[:, :, 0] = motion_mask
+        debug_vis_ds = np.zeros((self.downsample_size[1], self.downsample_size[0], 3), dtype=np.uint8)
+        debug_vis_ds[:, :, 2] = raw_mask_clean
+        debug_vis_ds[:, :, 1] = (self.static_mask * 255).astype(np.uint8)
+        debug_vis_ds[:, :, 0] = motion_mask
+        debug_vis = cv2.resize(debug_vis_ds, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
 
         return active_cells, debug_vis
     # --- DETECTOR 2: YOLO (Bounding Boxes) ---
@@ -201,26 +224,46 @@ class MatrixGrid:
         return active_cells
 
     # --- MASTER UPDATE FUNCTION ---
-    def update(self, frame, yolo_boxes, tracked_objects=None, mode="CITY"):
+    def update(self, frame, yolo_boxes, tracked_objects=None, mode="CITY", safe_state=False):
+        """Update the grid state based on vision inputs.
+
+        Args:
+            frame: Current camera frame (BGR).
+            yolo_boxes: Latest YOLO detections.
+            tracked_objects: Centroid-tracked objects from previous frames.
+            mode: "CITY" or "HIGHWAY" (affects sensitivity).
+            safe_state: If True, assume sensors are unreliable and apply full dimming.
+
+        Returns:
+            final_blocked_cells: list of (row, col) cells that should be dimmed.
+            debug_mask: visualization image showing blob/ROI/motion masks.
+            source_map: dict mapping each blocked cell to the set of triggers that caused it.
         """
-        Safety-First Hybrid Logic:
-        - We ALWAYS trust the Blob Detector (because high beams wash out YOLO).
-        - We ADD YOLO detections to catch non-glaring cars.
-        """
+        # Store frame for any visualization / hardware rendering
+        self.last_frame = frame
+
+        # If we are in a fail-safe condition, block everything.
+        if safe_state or frame is None:
+            all_cells = {(r, c) for r in range(self.rows) for c in range(self.cols)}
+            # Force cooldown so the UI transitions smoothly
+            for r, c in all_cells:
+                self.cooldown_tracker[r, c] = self.cooldown_frames
+                self.target_alpha[r, c] = self.max_alpha
+                self.alpha[r, c] = self.max_alpha
+            return list(all_cells), None, {cell: {"SAFE"} for cell in all_cells}
+
         active_cells = set()
         debug_mask = None
 
         # 1. Always Run Blob Detection (Primary)
         # We adjust sensitivity based on mode, but we always run it.
         if mode == "CITY":
-            # In City, we might use a higher threshold to ignore reflections/streetlights
             blob_cells, debug_mask = self._get_brightness_cells(
                 frame,
                 threshold=self.city_threshold,
                 min_blob_area=self.city_min_blob_area,
             )
         else:  # HIGHWAY
-            # In Highway, we need max sensitivity (catch distant lights)
             blob_cells, debug_mask = self._get_brightness_cells(
                 frame,
                 threshold=self.highway_threshold,
@@ -233,17 +276,27 @@ class MatrixGrid:
         # 2b. Map tracked objects (centroid -> columns)
         tracked_cells = self._get_tracked_cells(tracked_objects) if tracked_objects is not None else set()
 
+        # Build a source map for logging
+        source_map = {}
+        for cell in blob_cells:
+            source_map.setdefault(cell, set()).add("BLOB")
+        for cell in yolo_cells:
+            source_map.setdefault(cell, set()).add("YOLO")
+        for cell in tracked_cells:
+            source_map.setdefault(cell, set()).add("TRACK")
+
         # 3. SAFETY UNION: Combine BOTH results
         # If EITHER system sees a threat, we block the cell.
         # Combine blob detector, YOLO and tracked mapping
-        combined_active_cells = blob_cells.union(yolo_cells).union(tracked_cells)
+        combined_active_cells = set(source_map.keys())
 
         # --- COOLDOWN LOGIC ---
         # Update cooldown and target alpha per cell
         final_blocked_cells = []
         for row in range(self.rows):
             for col in range(self.cols):
-                if (row, col) in combined_active_cells:
+                cell = (row, col)
+                if cell in combined_active_cells:
                     self.cooldown_tracker[row, col] = self.cooldown_frames
                 else:
                     if self.cooldown_tracker[row, col] > 0:
@@ -260,9 +313,9 @@ class MatrixGrid:
 
                 # Consider cell blocked if alpha is above small threshold
                 if self.alpha[row, col] > 0.03:
-                    final_blocked_cells.append((row, col))
+                    final_blocked_cells.append(cell)
 
-        return final_blocked_cells, debug_mask
+        return final_blocked_cells, debug_mask, source_map
 
     def draw_grid(self, frame, active_glare_cells=[]):
         # If legacy style requested, render using previous colored grid (yellow light, red borders)
