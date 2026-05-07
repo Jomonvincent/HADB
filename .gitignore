@@ -21,9 +21,10 @@ __pycache__/
 Thumbs.db
 
 # Logs
-*.log
-
+*.logs
+logs/*.csv
 # Environment variables
 .env
 
+HADB/logs/glare_events.csv
 CHANGES.md

@@ -113,22 +113,4 @@ class YoloBrain:
     def detect_vehicles(self, frame=None):
         """Legacy API: Return the most recent detections."""
         return self._infer(frame)
-        """
-        Sprint 2: Inference Loop
-        Scans the frame and returns bounding boxes with class names.
-        Returns: list of [x1, y1, x2, y2, class_name]
-        """
-        results = self.model(frame, verbose=False) # Run inference
-        detections = []
-
-        for result in results:
-            for box in result.boxes.data.tolist():
-                x1, y1, x2, y2, score, class_id = box
-                
-                # Filter: Only accept if confidence is high AND it is a vehicle
-                if score > self.conf_threshold and int(class_id) in self.target_classes:
-                    c_name = self.class_names.get(int(class_id), "Vehicle")
-                    # Return box coordinates + label
-                    detections.append([int(x1), int(y1), int(x2), int(y2), c_name])
         
-        return detections

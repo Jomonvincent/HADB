@@ -4,3 +4,4 @@ charset-normalizer==3.4.4
 pip-chill==1.0.5
 pipreqs==0.4.13
 ultralytics==8.3.243
+opencv-python==4.13.0.92

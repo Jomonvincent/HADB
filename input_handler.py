@@ -11,6 +11,7 @@ class VideoLoader:
             height (int): Target height for resizing.
         """
         self.cap = cv2.VideoCapture(source)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) #reduce latency by keeping only the latest frame in buffer
         self.width = width
         self.height = height
         

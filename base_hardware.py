@@ -103,7 +103,7 @@ class RPiHardware(BaseHardware):
         if self.logger:
             self.logger.info("RPiHardware initialized (stub)")
 
-    def apply_dimming(self, active_cells, grid):
+    def apply_dimming(self,frame, active_cells, grid):
         if not self.initialized:
             raise RuntimeError("Hardware not initialized")
         # TODO: Convert active_cells into PWM output values. Example:

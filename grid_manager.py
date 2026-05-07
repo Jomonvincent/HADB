@@ -87,13 +87,23 @@ class MatrixGrid:
         """Detects bright blobs (headlights) using a downsampled ROI.
 
         The system defaults to a "safe state" by requiring motion confirmation and
-        by ignoring the sky / hood regions.
+        by ignoring the sky / hood regions. Threshold adapts to scene brightness
+        automatically so it works in both daylight and night conditions.
         """
         # Downsample the frame for faster processing
         ds_frame = cv2.resize(frame, self.downsample_size)
         gray = cv2.cvtColor(ds_frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, raw_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
+
+        # Adaptive threshold: base it on the median brightness of the frame
+        # so it adjusts automatically for night, fog, rain, etc.
+        # The +60 offset ensures we only catch pixels significantly brighter
+        # than the scene average (e.g. headlights against a dark road).
+        # max(..., threshold) keeps the config value as a minimum floor.
+        median_brightness = float(np.median(blurred))
+        adaptive_threshold = max(median_brightness + 60, threshold)
+
+        _, raw_mask = cv2.threshold(blurred, adaptive_threshold, 255, cv2.THRESH_BINARY)
 
         # Apply vertical ROI: ignore top (sky/streetlights) and bottom (hood)
         h = raw_mask.shape[0]
@@ -144,7 +154,7 @@ class MatrixGrid:
             roi_motion = motion_mask[y:y+h, x:x+w]
             overlap = int(cv2.countNonZero(roi_motion))
             if overlap < self.motion_required_overlap:
-                # small or no motion — treat cautiously, ignore as headlight
+                # Small or no motion — treat cautiously, ignore as headlight
                 continue
 
             # Passed heuristics — mark as valid blob
